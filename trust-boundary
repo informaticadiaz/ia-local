@@ -1,0 +1,139 @@
+# Trust Boundary: Quién Decide vs Quién Ejecuta
+
+*Notas de estudio a partir del análisis de `gentle-pi`*
+
+---
+
+## 1. La frase que resume todo
+
+> "Trust what the system can derive, not what an agent claims."
+
+Traducido: confiá en lo que el sistema puede **derivar objetivamente** de evidencia verificable, no en lo que el agente **afirma** que pasó.
+
+Esta distinción — *derivar* vs *afirmar* — es el corazón de todo diseño de seguridad de sistemas. Un dato **derivado** se calcula a partir de una fuente de verdad verificable (un hash de Git, un diff real, un test que corrió y devolvió un exit code). Un dato **afirmado** es una declaración de un actor no confiable ("ya revisé el código y está todo bien", "los tests pasan").
+
+`gentle-pi` construye toda su arquitectura de revisión sobre esta distinción: el LLM puede *analizar*, pero nunca puede *autorizar*.
+
+---
+
+## 2. El paralelo con "nunca confíes en el input del cliente"
+
+En desarrollo web, esto es una lección que todo ingeniero aprende (a veces de la peor manera):
+
+```javascript
+// MAL — el cliente decide el precio
+app.post('/checkout', (req, res) => {
+  const total = req.body.total; // el cliente lo mandó
+  chargeCard(total);
+});
+
+// BIEN — el servidor deriva el precio desde su propia fuente de verdad
+app.post('/checkout', (req, res) => {
+  const items = req.body.items; // el cliente solo dice QUÉ quiere
+  const total = calculateTotalFromDB(items); // el servidor decide CUÁNTO cuesta
+  chargeCard(total);
+});
+```
+
+El cliente puede *pedir* algo, pero nunca puede *declarar* el resultado de un cálculo que afecta la autorización de una acción. Esa autoridad vive del lado que controlás vos.
+
+`gentle-pi` aplica exactamente esta misma regla, reemplazando "cliente" por "agente LLM":
+
+```
+MAL:  El LLM dice "reviewé el diff y está todo bien, aprobado"
+      → el sistema confía ciegamente y permite el commit
+
+BIEN: El LLM produce un análisis (findings, evidencia)
+      → el sistema NATIVO deriva independientemente qué cambió
+        (via Git: hashes, árboles, diffs reales)
+      → el sistema NATIVO decide si eso constituye "aprobado"
+      → el LLM nunca tiene el poder de otorgar autoridad
+```
+
+La razón de fondo es la misma en ambos casos: **el actor que puede ser manipulado, engañado, o simplemente equivocarse, no puede ser la misma capa que emite la autorización final.**
+
+---
+
+## 3. Por qué un LLM es, en este sentido, como un cliente no confiable
+
+Vale la pena ser preciso acá — no es que el LLM sea "malicioso" como podría serlo un atacante manipulando un request HTTP. El problema es más sutil y en cierto modo más difícil de manejar:
+
+| Cliente HTTP no confiable | Agente LLM no confiable |
+|---|---|
+| Puede mentir deliberadamente (atacante) | Puede alucinar sin intención (no hay "mentira", hay error) |
+| El input es estructurado y validable por schema | El "input" es lenguaje natural, ambiguo por naturaleza |
+| Falla de forma predecible (rechazás el request) | Puede fallar de formas creativas e impredecibles |
+| Es fácil trazar *por qué* falló | La causa de un error de razonamiento no siempre es clara |
+
+Esto hace que la separación de autoridad sea **más importante todavía** con agentes que con clientes tradicionales, porque no podés simplemente "arreglar la validación" — el espacio de formas en que puede fallar es mucho más grande.
+
+---
+
+## 4. Cómo lo implementa `gentle-pi` concretamente
+
+### 4.1 El "candidato" congelado
+
+Cuando arranca una revisión, el sistema nativo (no el LLM) deriva un **snapshot completo del estado de Git**: qué archivos cambiaron, sus hashes, el árbol exacto. Esto se "congela" como el *candidato* — una foto inmutable de la realidad.
+
+A partir de ahí, el LLM analiza *ese candidato específico*, nunca "lo que el LLM cree que cambió". Si el LLM describe un cambio que no está en el candidato, esa afirmación es descartada — no tiene autoridad para inventar scope.
+
+### 4.2 Evidencia obligatoria, no narración
+
+Cada finding de una revisión requiere:
+- `evidence_class` (tipo de evidencia)
+- `causal_disposition` (si el problema fue introducido, preexistente, etc.)
+- Prueba concreta: un hunk de diff real, una ruta de archivo creada, un test diferencial, un antes/después verificable.
+
+> "Actor output is untrusted data and cannot authorize transitions, fixes, receipts, gates, or delivery."
+
+Es decir: literalmente lo que el LLM produce se trata como **datos no confiables** en el pipeline — se puede usar como insumo para el análisis, pero nunca como el disparador de una transición de estado.
+
+### 4.3 Receipts atados por hash
+
+Cuando algo se aprueba, el sistema emite un "receipt" atado criptográficamente (por hash) al árbol de Git exacto que fue revisado. Si el código cambia después — aunque sea una línea — ese receipt deja de ser válido para ese nuevo estado. No hay forma de que el LLM diga "confiá en mí, esto ya fue aprobado" sobre un estado distinto al que realmente se congeló.
+
+### 4.4 Fail closed ante ambigüedad
+
+Cualquier situación rara —autoridad corrupta, target ambiguo, evidencia faltante— bloquea el proceso en vez de asumir que "probablemente está bien". Esto es la contraparte de una validación de input estricta: preferís rechazar de más antes que aceptar algo que no podés verificar.
+
+---
+
+## 5. El límite explícito de esta protección
+
+El repo es honesto sobre hasta dónde llega este modelo de confianza, y esto es tan valioso de estudiar como el mecanismo en sí:
+
+> "Trust boundary: The local orchestrator and same-user process are trusted to execute selected actors and submit their exact outputs. [...] Malicious same-user host/process authenticity is a non-goal because that actor can replace the extension or mutate local authority."
+
+Traducido: este sistema protege contra que **el LLM mienta o se equivoque sobre qué cambió o si algo está aprobado**. No protege contra un **proceso malicioso corriendo con los mismos permisos del usuario** que directamente reemplace el binario o manipule los archivos de autoridad. Ese es un problema de seguridad distinto (integridad del sistema operativo/entorno), fuera del alcance de este diseño.
+
+Esto es una distinción importante en cualquier modelo de amenazas (*threat model*): **definir explícitamente qué NO estás protegiendo es tan importante como definir qué sí.** Un sistema que promete proteger contra todo, en la práctica no protege bien contra nada — la claridad del límite es lo que hace la garantía creíble.
+
+---
+
+## 6. Por qué esto importa más allá de este proyecto puntual
+
+Esta separación — *derivar vs. afirmar*, *ejecutor vs. autoridad* — es un patrón que vas a encontrar una y otra vez a medida que los agentes de IA se meten en flujos de trabajo con consecuencias reales (deploys, pagos, borrado de datos, publicación de código):
+
+- **CI/CD tradicional** ya tenía esta idea: un pipeline no confía en que el desarrollador diga "ya probé esto localmente y anda", corre los tests él mismo.
+- **Sistemas financieros**: nunca confían en que el cliente calcule su propio balance; siempre se recalcula server-side.
+- **Blockchain / sistemas distribuidos**: "no confíes, verificá" (*don't trust, verify*) es literalmente el lema de por qué existen los hashes y las pruebas criptográficas en vez de declaraciones.
+
+La aparición de agentes LLM no inventa este problema — lo que hace es ponerlo sobre la mesa de nuevo, porque es tentador tratar a un LLM como si fuera confiable *porque suena seguro de sí mismo*. El texto que genera un LLM tiene la forma gramatical de una afirmación autoritativa incluso cuando está completamente equivocado. Diseñar sistemas que no caigan en esa trampa es, quizás, el problema central de la ingeniería de software con IA en este momento.
+
+---
+
+## 7. Preguntas para seguir pensando
+
+1. Si tuvieras que diseñar el trust boundary para un agente que gestiona una base de datos de producción (no solo Git), ¿qué sería el equivalente al "hash del árbol de commit"? ¿Qué fuente de verdad usarías para derivar el estado real?
+2. ¿Dónde está el balance entre "fail closed siempre" y usabilidad? Un sistema que bloquea ante cualquier ambigüedad puede volverse inutilizable si la ambigüedad es demasiado frecuente.
+3. En tu propio proyecto (Amauta, o Reparto), ¿hay algún punto donde hoy confiás en que el LLM "diga" que algo está bien, en vez de verificarlo independientemente? ¿Cómo se vería agregar un trust boundary ahí?
+4. ¿Este patrón se puede aplicar de forma más liviana (sin todo el aparato de receipts/hashes) en proyectos chicos, o pierde sentido si no es tan riguroso?
+
+---
+
+## 8. Lectura de referencia
+
+- Principio "never trust user input" — OWASP, fundamentos de seguridad web.
+- "Don't trust, verify" — cultura de sistemas distribuidos y blockchain.
+- El repo mismo: [`Gentleman-Programming/gentle-pi`](https://github.com/Gentleman-Programming/gentle-pi), secciones "Trust boundary" y "Bounded review transactions".
+- [Gentle AI's review authority threat model](https://github.com/Gentleman-Programming/gentle-ai/blob/main/docs/review-authority-threat-model.md) — documento referenciado por el propio repo, va más a fondo en el modelo de amenazas.
